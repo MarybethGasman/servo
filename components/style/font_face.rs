@@ -15,24 +15,24 @@ use crate::str::CssStringWriter;
 use crate::values::computed::font::{FamilyName, FontStretch};
 use crate::values::generics::font::FontStyle as GenericFontStyle;
 #[cfg(feature = "gecko")]
-use crate::values::specified::font::SpecifiedFontFeatureSettings;
+use crate::values::specified::font::MetricsOverride;
 use crate::values::specified::font::SpecifiedFontStyle;
-#[cfg(feature = "gecko")]
-use crate::values::specified::font::SpecifiedFontVariationSettings;
 use crate::values::specified::font::{AbsoluteFontWeight, FontStretch as SpecifiedFontStretch};
 #[cfg(feature = "gecko")]
-use crate::values::specified::font::MetricsOverride;
+use crate::values::specified::font::{FontFeatureSettings, FontVariationSettings};
 use crate::values::specified::url::SpecifiedUrl;
 use crate::values::specified::Angle;
 #[cfg(feature = "gecko")]
 use crate::values::specified::NonNegativePercentage;
 #[cfg(feature = "gecko")]
 use cssparser::UnicodeRange;
-use cssparser::{AtRuleParser, DeclarationListParser, DeclarationParser, Parser};
-use cssparser::{CowRcStr, SourceLocation};
+use cssparser::{
+    AtRuleParser, CowRcStr, DeclarationParser, Parser, QualifiedRuleParser, RuleBodyItemParser,
+    RuleBodyParser, SourceLocation,
+};
 use selectors::parser::SelectorParseErrorKind;
 use std::fmt::{self, Write};
-use style_traits::{Comma, CssWriter, OneOrMoreSeparated, ParseError};
+use style_traits::{CssWriter, ParseError};
 use style_traits::{StyleParseErrorKind, ToCss};
 
 /// A source for a font-face rule.
@@ -46,8 +46,35 @@ pub enum Source {
     Local(FamilyName),
 }
 
-impl OneOrMoreSeparated for Source {
-    type S = Comma;
+/// A list of sources for the font-face src descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, ToCss, ToShmem)]
+#[css(comma)]
+pub struct SourceList(#[css(iterable)] pub Vec<Source>);
+
+// We can't just use OneOrMoreSeparated to derive Parse for the Source list,
+// because we want to filter out components that parsed as None, then fail if no
+// valid components remain. So we provide our own implementation here.
+impl Parse for SourceList {
+    fn parse<'i, 't>(
+        context: &ParserContext,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self, ParseError<'i>> {
+        // Parse the comma-separated list, then let filter_map discard any None items.
+        let list = input
+            .parse_comma_separated(|input| {
+                let s = input.parse_entirely(|input| Source::parse(context, input));
+                while input.next().is_ok() {}
+                Ok(s.ok())
+            })?
+            .into_iter()
+            .filter_map(|s| s)
+            .collect::<Vec<Source>>();
+        if list.is_empty() {
+            Err(input.new_custom_error(StyleParseErrorKind::UnspecifiedError))
+        } else {
+            Ok(SourceList(list))
+        }
+    }
 }
 
 /// Keywords for the font-face src descriptor's format() function.
@@ -78,11 +105,11 @@ bitflags! {
     #[repr(C)]
     pub struct FontFaceSourceTechFlags: u16 {
         /// Font requires OpenType feature support.
-        const FEATURE_OPENTYPE = 1 << 0;
+        const FEATURES_OPENTYPE = 1 << 0;
         /// Font requires Apple Advanced Typography support.
-        const FEATURE_AAT = 1 << 1;
+        const FEATURES_AAT = 1 << 1;
         /// Font requires Graphite shaping support.
-        const FEATURE_GRAPHITE = 1 << 2;
+        const FEATURES_GRAPHITE = 1 << 2;
         /// Font requires COLRv0 rendering support (simple list of colored layers).
         const COLOR_COLRV0 = 1 << 3;
         /// Font requires COLRv1 rendering support (graph of paint operations).
@@ -106,9 +133,9 @@ impl FontFaceSourceTechFlags {
     /// Parse a single font-technology keyword and return its flag.
     pub fn parse_one<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Self, ParseError<'i>> {
         Ok(try_match_ident_ignore_ascii_case! { input,
-            "feature-opentype" => Self::FEATURE_OPENTYPE,
-            "feature-aat" => Self::FEATURE_AAT,
-            "feature-graphite" => Self::FEATURE_GRAPHITE,
+            "features-opentype" => Self::FEATURES_OPENTYPE,
+            "features-aat" => Self::FEATURES_AAT,
+            "features-graphite" => Self::FEATURES_GRAPHITE,
             "color-colrv0" => Self::COLOR_COLRV0,
             "color-colrv1" => Self::COLOR_COLRV1,
             "color-svg" => Self::COLOR_SVG,
@@ -164,9 +191,9 @@ impl ToCss for FontFaceSourceTechFlags {
             };
         }
 
-        write_if_flag!("feature-opentype" => FEATURE_OPENTYPE);
-        write_if_flag!("feature-aat" => FEATURE_AAT);
-        write_if_flag!("feature-graphite" => FEATURE_GRAPHITE);
+        write_if_flag!("features-opentype" => FEATURES_OPENTYPE);
+        write_if_flag!("features-aat" => FEATURES_AAT);
+        write_if_flag!("features-graphite" => FEATURES_GRAPHITE);
         write_if_flag!("color-colrv0" => COLOR_COLRV0);
         write_if_flag!("color-colrv1" => COLOR_COLRV1);
         write_if_flag!("color-svg" => COLOR_SVG);
@@ -281,7 +308,7 @@ macro_rules! impl_range {
             {
                 self.0.to_css(dest)?;
                 if self.0 != self.1 {
-                    dest.write_str(" ")?;
+                    dest.write_char(' ')?;
                     self.1.to_css(dest)?;
                 }
                 Ok(())
@@ -443,11 +470,11 @@ pub fn parse_font_face_block(
 ) -> FontFaceRuleData {
     let mut rule = FontFaceRuleData::empty(location);
     {
-        let parser = FontFaceRuleParser {
-            context: context,
+        let mut parser = FontFaceRuleParser {
+            context,
             rule: &mut rule,
         };
-        let mut iter = DeclarationListParser::new(input, parser);
+        let mut iter = RuleBodyParser::new(input, &mut parser);
         while let Some(declaration) = iter.next() {
             if let Err((error, slice)) = declaration {
                 let location = error.location;
@@ -477,6 +504,7 @@ impl<'a> FontFace<'a> {
     pub fn effective_sources(&self) -> EffectiveSources {
         EffectiveSources(
             self.sources()
+                .0
                 .iter()
                 .rev()
                 .filter(|source| {
@@ -532,6 +560,23 @@ impl<'a, 'b, 'i> AtRuleParser<'i> for FontFaceRuleParser<'a, 'b> {
     type Error = StyleParseErrorKind<'i>;
 }
 
+impl<'a, 'b, 'i> QualifiedRuleParser<'i> for FontFaceRuleParser<'a, 'b> {
+    type Prelude = ();
+    type QualifiedRule = ();
+    type Error = StyleParseErrorKind<'i>;
+}
+
+impl<'a, 'b, 'i> RuleBodyItemParser<'i, (), StyleParseErrorKind<'i>>
+    for FontFaceRuleParser<'a, 'b>
+{
+    fn parse_qualified(&self) -> bool {
+        false
+    }
+    fn parse_declarations(&self) -> bool {
+        true
+    }
+}
+
 fn font_tech_enabled() -> bool {
     #[cfg(feature = "gecko")]
     return static_prefs::pref!("layout.css.font-tech.enabled");
@@ -582,7 +627,11 @@ impl Parse for Source {
             FontFaceSourceTechFlags::empty()
         };
 
-        Ok(Source::Url(UrlSource { url, format_hint, tech_flags }))
+        Ok(Source::Url(UrlSource {
+            url,
+            format_hint,
+            tech_flags,
+        }))
     }
 }
 
@@ -643,7 +692,7 @@ macro_rules! font_face_descriptors_common {
                 $(
                     if let Some(ref value) = self.$ident {
                         dest.write_str(concat!($name, ": "))?;
-                        ToCss::to_css(value, &mut CssWriter::new(dest))?;
+                        value.to_css(&mut CssWriter::new(dest))?;
                         dest.write_str("; ")?;
                     }
                 )*
@@ -684,7 +733,7 @@ impl ToCssWithGuard for FontFaceRuleData {
     fn to_css(&self, _guard: &SharedRwLockReadGuard, dest: &mut CssStringWriter) -> fmt::Result {
         dest.write_str("@font-face { ")?;
         self.decl_to_css(dest)?;
-        dest.write_str("}")
+        dest.write_char('}')
     }
 }
 
@@ -737,7 +786,7 @@ font_face_descriptors! {
         "font-family" family / mFamily: FamilyName,
 
         /// The alternative sources for this font face.
-        "src" sources / mSrc: Vec<Source>,
+        "src" sources / mSrc: SourceList,
     ]
     optional descriptors = [
         /// The style of this font face.
@@ -756,10 +805,10 @@ font_face_descriptors! {
         "unicode-range" unicode_range / mUnicodeRange: Vec<UnicodeRange>,
 
         /// The feature settings of this font face.
-        "font-feature-settings" feature_settings / mFontFeatureSettings: SpecifiedFontFeatureSettings,
+        "font-feature-settings" feature_settings / mFontFeatureSettings: FontFeatureSettings,
 
         /// The variation settings of this font face.
-        "font-variation-settings" variation_settings / mFontVariationSettings: SpecifiedFontVariationSettings,
+        "font-variation-settings" variation_settings / mFontVariationSettings: FontVariationSettings,
 
         /// The language override of this font face.
         "font-language-override" language_override / mFontLanguageOverride: font_language_override::SpecifiedValue,
@@ -785,7 +834,7 @@ font_face_descriptors! {
         "font-family" family / mFamily: FamilyName,
 
         /// The alternative sources for this font face.
-        "src" sources / mSrc: Vec<Source>,
+        "src" sources / mSrc: SourceList,
     ]
     optional descriptors = [
     ]

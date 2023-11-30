@@ -12,7 +12,7 @@ use canvas_traits::canvas::{
     FillRule, LineCapStyle, LineJoinStyle, LinearGradientStyle, RadialGradientStyle,
     RepetitionStyle, TextAlign, TextBaseline,
 };
-use cssparser::{Color as CSSColor, Parser, ParserInput, RGBA};
+use cssparser::{Parser, ParserInput, RGBA};
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use euclid::vec2;
 use ipc_channel::ipc::{self, IpcSender, IpcSharedMemory};
@@ -22,17 +22,22 @@ use pixels::PixelFormat;
 use profile_traits::ipc as profiled_ipc;
 use script_traits::ScriptMsg;
 use servo_url::{ImmutableOrigin, ServoUrl};
+use style::color::{AbsoluteColor, ColorSpace};
+use style::context::QuirksMode;
+use style::parser::ParserContext;
 use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
 use style::properties::style_structs::Font;
+use style::stylesheets::{CssRuleType, Origin};
 use style::values::computed::font::FontStyle;
+use style::values::specified::color::Color;
 use style_traits::values::ToCss;
+use style_traits::ParsingMode;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::{
     CanvasDirection, CanvasFillRule, CanvasImageSource, CanvasLineCap, CanvasLineJoin,
-    CanvasTextAlign, CanvasTextBaseline,
+    CanvasTextAlign, CanvasTextBaseline, ImageDataMethods,
 };
-use crate::dom::bindings::codegen::Bindings::ImageDataBinding::ImageDataMethods;
 use crate::dom::bindings::codegen::UnionTypes::StringOrCanvasGradientOrCanvasPattern;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -107,7 +112,7 @@ impl CanvasContextState {
     const DEFAULT_FONT_STYLE: &'static str = "10px sans-serif";
 
     pub(crate) fn new() -> CanvasContextState {
-        let black = RGBA::new(0, 0, 0, 255);
+        let black = RGBA::new(Some(0), Some(0), Some(0), Some(1.0));
         CanvasContextState {
             global_alpha: 1.0,
             global_composition: CompositionOrBlending::default(),
@@ -122,7 +127,7 @@ impl CanvasContextState {
             shadow_offset_x: 0.0,
             shadow_offset_y: 0.0,
             shadow_blur: 0.0,
-            shadow_color: RGBA::transparent(),
+            shadow_color: RGBA::new(Some(0), Some(0), Some(0), Some(0.0)),
             font_style: None,
             text_align: Default::default(),
             text_baseline: Default::default(),
@@ -294,43 +299,6 @@ impl CanvasState {
                 self.missing_image_urls.borrow_mut().push(url);
                 ImageResponse::None
             },
-        }
-    }
-
-    fn parse_color(&self, canvas: Option<&HTMLCanvasElement>, string: &str) -> Result<RGBA, ()> {
-        let mut input = ParserInput::new(string);
-        let mut parser = Parser::new(&mut input);
-        let color = CSSColor::parse(&mut parser);
-        if parser.is_exhausted() {
-            match color {
-                Ok(CSSColor::RGBA(rgba)) => Ok(rgba),
-                Ok(CSSColor::CurrentColor) => {
-                    // TODO: https://github.com/whatwg/html/issues/1099
-                    // Reconsider how to calculate currentColor in a display:none canvas
-
-                    // TODO: will need to check that the context bitmap mode is fixed
-                    // once we implement CanvasProxy
-                    let canvas = match canvas {
-                        // https://drafts.css-houdini.org/css-paint-api/#2d-rendering-context
-                        // Whenever "currentColor" is used as a color in the PaintRenderingContext2D API,
-                        // it is treated as opaque black.
-                        None => return Ok(RGBA::new(0, 0, 0, 255)),
-                        Some(ref canvas) => &**canvas,
-                    };
-
-                    let canvas_element = canvas.upcast::<Element>();
-
-                    match canvas_element.style() {
-                        Some(ref s) if canvas_element.has_css_layout_box() => {
-                            Ok(s.get_inherited_text().color)
-                        },
-                        _ => Ok(RGBA::new(0, 0, 0, 255)),
-                    }
-                },
-                _ => Err(()),
-            }
-        } else {
-            Err(())
         }
     }
 
@@ -754,10 +722,10 @@ impl CanvasState {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-shadowcolor
-    pub fn set_shadow_color(&self, value: DOMString) {
-        if let Ok(color) = parse_color(&value) {
-            self.state.borrow_mut().shadow_color = color;
-            self.send_canvas_2d_msg(Canvas2dMsg::SetShadowColor(color))
+    pub fn set_shadow_color(&self, canvas: Option<&HTMLCanvasElement>, value: DOMString) {
+        if let Ok(rgba) = parse_color(canvas, &value) {
+            self.state.borrow_mut().shadow_color = rgba;
+            self.send_canvas_2d_msg(Canvas2dMsg::SetShadowColor(rgba))
         }
     }
 
@@ -786,7 +754,7 @@ impl CanvasState {
     ) {
         match value {
             StringOrCanvasGradientOrCanvasPattern::String(string) => {
-                if let Ok(rgba) = self.parse_color(canvas, &string) {
+                if let Ok(rgba) = parse_color(canvas, &string) {
                     self.state.borrow_mut().stroke_style = CanvasFillOrStrokeStyle::Color(rgba);
                 }
             },
@@ -829,7 +797,7 @@ impl CanvasState {
     ) {
         match value {
             StringOrCanvasGradientOrCanvasPattern::String(string) => {
-                if let Ok(rgba) = self.parse_color(canvas, &string) {
+                if let Ok(rgba) = parse_color(canvas, &string) {
                     self.state.borrow_mut().fill_style = CanvasFillOrStrokeStyle::Color(rgba);
                 }
             },
@@ -1703,18 +1671,54 @@ impl CanvasState {
     }
 }
 
-pub fn parse_color(string: &str) -> Result<RGBA, ()> {
+pub fn parse_color(canvas: Option<&HTMLCanvasElement>, string: &str) -> Result<RGBA, ()> {
     let mut input = ParserInput::new(string);
     let mut parser = Parser::new(&mut input);
-    match CSSColor::parse(&mut parser) {
-        Ok(CSSColor::RGBA(rgba)) => {
-            if parser.is_exhausted() {
-                Ok(rgba)
-            } else {
-                Err(())
-            }
+    let url = ServoUrl::parse("about:blank").unwrap();
+    let context = ParserContext::new(
+        Origin::Author,
+        &url,
+        Some(CssRuleType::Style),
+        ParsingMode::DEFAULT,
+        QuirksMode::NoQuirks,
+        /* namespaces = */ Default::default(),
+        None,
+        None,
+    );
+    match Color::parse_and_compute(&context, &mut parser, None) {
+        Some(color) => {
+            // TODO: https://github.com/whatwg/html/issues/1099
+            // Reconsider how to calculate currentColor in a display:none canvas
+
+            // TODO: will need to check that the context bitmap mode is fixed
+            // once we implement CanvasProxy
+            let current_color = match canvas {
+                // https://drafts.css-houdini.org/css-paint-api/#2d-rendering-context
+                // Whenever "currentColor" is used as a color in the PaintRenderingContext2D API,
+                // it is treated as opaque black.
+                None => AbsoluteColor::black(),
+                Some(ref canvas) => {
+                    let canvas_element = canvas.upcast::<Element>();
+                    match canvas_element.style() {
+                        Some(ref s) if canvas_element.has_css_layout_box() => {
+                            s.get_inherited_text().color
+                        },
+                        _ => AbsoluteColor::black(),
+                    }
+                },
+            };
+
+            let rgba = color
+                .resolve_to_absolute(&current_color)
+                .to_color_space(ColorSpace::Srgb);
+            Ok(RGBA::from_floats(
+                Some(rgba.components.0),
+                Some(rgba.components.1),
+                Some(rgba.components.2),
+                Some(rgba.alpha),
+            ))
         },
-        _ => Err(()),
+        None => Err(()),
     }
 }
 
@@ -1729,11 +1733,12 @@ pub fn serialize<W>(color: &RGBA, dest: &mut W) -> fmt::Result
 where
     W: fmt::Write,
 {
-    let red = color.red;
-    let green = color.green;
-    let blue = color.blue;
+    let red = color.red.unwrap_or(0);
+    let green = color.green.unwrap_or(0);
+    let blue = color.blue.unwrap_or(0);
+    let alpha = color.alpha.unwrap_or(0.0);
 
-    if color.alpha == 255 {
+    if alpha == 1.0 {
         write!(
             dest,
             "#{:x}{:x}{:x}{:x}{:x}{:x}",
@@ -1745,14 +1750,7 @@ where
             blue & 0xF
         )
     } else {
-        write!(
-            dest,
-            "rgba({}, {}, {}, {})",
-            red,
-            green,
-            blue,
-            color.alpha_f32()
-        )
+        write!(dest, "rgba({}, {}, {}, {})", red, green, blue, alpha)
     }
 }
 

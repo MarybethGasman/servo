@@ -7,8 +7,6 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-from __future__ import print_function, unicode_literals
-
 import argparse
 import logging
 import re
@@ -37,7 +35,6 @@ import tidy
 
 from servo.command_base import BuildType, CommandBase, call, check_call
 from servo.util import delete
-from distutils.dir_util import copy_tree
 
 SCRIPT_PATH = os.path.split(__file__)[0]
 PROJECT_TOPLEVEL_PATH = os.path.abspath(os.path.join(SCRIPT_PATH, "..", ".."))
@@ -177,8 +174,8 @@ class MachCommands(CommandBase):
                      help="Run in bench mode")
     @CommandArgument('--nocapture', default=False, action="store_true",
                      help="Run tests with nocapture ( show test stdout )")
-    @CommandBase.common_command_arguments(build_configuration=True, build_type=False)
-    def test_unit(self, test_name=None, package=None, bench=False, nocapture=False, **kwargs):
+    @CommandBase.common_command_arguments(build_configuration=True, build_type=True)
+    def test_unit(self, build_type: BuildType, test_name=None, package=None, bench=False, nocapture=False, **kwargs):
         if test_name is None:
             test_name = []
 
@@ -242,6 +239,14 @@ class MachCommands(CommandBase):
 
         # Gather Cargo build timings (https://doc.rust-lang.org/cargo/reference/timings.html).
         args = ["--timings"]
+
+        if build_type.is_release():
+            args += ["--release"]
+        elif build_type.is_dev():
+            pass  # there is no argument for debug
+        else:
+            args += ["--profile", build_type.profile]
+
         for crate in packages:
             args += ["-p", "%s_tests" % crate]
         for crate in in_crate_packages:
@@ -793,7 +798,7 @@ tests/wpt/mozilla/tests for Servo-only tests""" % reference_path)
             file.write(filedata)
         # copy
         delete(path.join(tdir, "webgpu"))
-        copy_tree(path.join(clone_dir, "out-wpt"), path.join(tdir, "webgpu"))
+        shutil.copytree(path.join(clone_dir, "out-wpt"), path.join(tdir, "webgpu"))
         # update commit
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=clone_dir).decode()
         with open(path.join(tdir, "checkout_commit.txt"), 'w') as file:

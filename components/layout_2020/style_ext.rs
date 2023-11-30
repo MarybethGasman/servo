@@ -320,10 +320,10 @@ impl ComputedValuesExt for ComputedValues {
         let border = self.get_border();
         LogicalSides::from_physical(
             &PhysicalSides::new(
-                border.border_top_width.0,
-                border.border_right_width.0,
-                border.border_bottom_width.0,
-                border.border_left_width.0,
+                border.border_top_width.into(),
+                border.border_right_width.into(),
+                border.border_bottom_width.into(),
+                border.border_left_width.into(),
             ),
             containing_block_writing_mode,
         )
@@ -472,7 +472,7 @@ impl ComputedValuesExt for ComputedValues {
     fn background_is_transparent(&self) -> bool {
         let background = self.get_background();
         let color = self.resolve_color(background.background_color.clone());
-        color.alpha == 0 &&
+        color.alpha == 0.0 &&
             background
                 .background_image
                 .0

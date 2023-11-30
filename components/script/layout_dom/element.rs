@@ -31,6 +31,7 @@ use style::selector_parser::{
     SelectorImpl,
 };
 use style::shared_lock::Locked as StyleLocked;
+use style::values::computed::Display;
 use style::values::{AtomIdent, AtomString};
 use style::CaseSensitivityExt;
 use style_traits::dom::ElementState;
@@ -243,11 +244,6 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TElement
     }
 
     #[inline]
-    fn has_attr(&self, namespace: &style::Namespace, attr: &style::LocalName) -> bool {
-        self.get_attr(&**namespace, &**attr).is_some()
-    }
-
-    #[inline]
     fn id(&self) -> Option<&Atom> {
         unsafe { (*self.element.id_attribute()).as_ref() }
     }
@@ -452,7 +448,10 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TElement
         self.element.namespace()
     }
 
-    fn primary_box_size(&self) -> euclid::default::Size2D<app_units::Au> {
+    fn query_container_size(
+        &self,
+        _display: &Display,
+    ) -> euclid::default::Size2D<Option<app_units::Au>> {
         todo!();
     }
 }
@@ -668,8 +667,20 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
         self.element.is_html_element() && self.as_node().owner_doc().is_html_document()
     }
 
-    fn set_selector_flags(&self, flags: ElementSelectorFlags) {
-        self.element.insert_selector_flags(flags);
+    fn apply_selector_flags(&self, flags: ElementSelectorFlags) {
+        // Handle flags that apply to the element.
+        let self_flags = flags.for_self();
+        if !self_flags.is_empty() {
+            self.element.insert_selector_flags(flags);
+        }
+
+        // Handle flags that apply to the parent.
+        let parent_flags = flags.for_parent();
+        if !parent_flags.is_empty() {
+            if let Some(p) = self.as_node().parent_element() {
+                p.element.insert_selector_flags(flags);
+            }
+        }
     }
 }
 
@@ -911,8 +922,20 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
         false
     }
 
-    fn set_selector_flags(&self, flags: ElementSelectorFlags) {
-        self.element.element.insert_selector_flags(flags);
+    fn apply_selector_flags(&self, flags: ElementSelectorFlags) {
+        // Handle flags that apply to the element.
+        let self_flags = flags.for_self();
+        if !self_flags.is_empty() {
+            self.element.element.insert_selector_flags(flags);
+        }
+
+        // Handle flags that apply to the parent.
+        let parent_flags = flags.for_parent();
+        if !parent_flags.is_empty() {
+            if let Some(p) = self.element.parent_element() {
+                p.element.insert_selector_flags(flags);
+            }
+        }
     }
 }
 
